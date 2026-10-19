@@ -272,6 +272,7 @@ protected:
     bool         on_mouse_for_rotation(const wxMouseEvent &mouse_event);
     void         show_selection_ui();
     void         show_distance_xyz_ui();
+    void         show_hole_enlargement_ui();
     void         show_point_point_assembly();
     void         show_face_face_assembly_common();
     void         show_face_face_assembly_senior();
@@ -329,6 +330,9 @@ protected:
     std::string              m_units;
     mutable bool             m_same_model_object;
     mutable unsigned int     m_current_active_imgui_id;
+    std::optional<Measure::SurfaceFeature> m_hole_enlargement_circle;
+    double                   m_hole_target_diameter{0.0};
+    double                   m_hole_clearance{0.2};
 };
 
 } // namespace GUI

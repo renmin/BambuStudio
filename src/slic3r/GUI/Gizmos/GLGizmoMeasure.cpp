@@ -2,6 +2,7 @@
 #include "GLGizmoRotate.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Gizmos/GizmoObjectManipulation.hpp"
 #include "slic3r/GUI/OpenGLManager.hpp"
@@ -2405,6 +2406,62 @@ void GLGizmoMeasure::show_distance_xyz_ui()
     }
 }
 
+void GLGizmoMeasure::show_hole_enlargement_ui()
+{
+    if (m_measure_mode != EMeasureMode::ONLY_MEASURE || m_selected_features.second.feature.has_value() ||
+        !m_selected_features.first.feature.has_value() ||
+        m_selected_features.first.feature->get_type() != Measure::SurfaceFeatureType::Circle)
+        return;
+
+    const Measure::SurfaceFeature& circle_feature = *m_selected_features.first.feature;
+    if (!circle_feature.volume)
+        return;
+
+    auto [center, radius, normal] = circle_feature.get_circle();
+    const Vec3d on_circle = center + radius * Measure::get_orthogonal(normal, true);
+    radius = (on_circle - center).norm();
+    const double current_diameter = 2.0 * radius;
+
+    if (!m_hole_enlargement_circle.has_value() || *m_hole_enlargement_circle != circle_feature) {
+        m_hole_enlargement_circle = circle_feature;
+        m_hole_target_diameter = current_diameter + m_hole_clearance;
+    }
+
+    ImGui::Separator();
+    m_imgui->text(_L("Hole enlargement"));
+
+    const double display_current_diameter = m_use_inches ? GizmoObjectManipulation::mm_to_in * current_diameter : current_diameter;
+    m_imgui->text(_u8L("Current diameter") + ": " + format_double(display_current_diameter) + m_units);
+
+    ImGui::PushItemWidth(m_input_size_max);
+    m_imgui->text(_u8L("Target diameter:"));
+    ImGui::SameLine(m_imgui->calc_text_size(_u8L("Target diameter:")).x + m_space_size);
+    double display_target_diameter = m_use_inches ? GizmoObjectManipulation::mm_to_in * m_hole_target_diameter : m_hole_target_diameter;
+    if (ImGui::BBLInputDouble("##hole_target_diameter", &display_target_diameter, 0.0f, 0.0f, "%.2f")) {
+        m_hole_target_diameter = m_use_inches ? display_target_diameter / GizmoObjectManipulation::mm_to_in : display_target_diameter;
+    }
+
+    m_imgui->text(_u8L("Clearance:"));
+    ImGui::SameLine(m_imgui->calc_text_size(_u8L("Target diameter:")).x + m_space_size);
+    double display_clearance = m_use_inches ? GizmoObjectManipulation::mm_to_in * m_hole_clearance : m_hole_clearance;
+    if (ImGui::BBLInputDouble("##hole_clearance", &display_clearance, 0.0f, 0.0f, "%.2f")) {
+        m_hole_clearance = m_use_inches ? display_clearance / GizmoObjectManipulation::mm_to_in : display_clearance;
+        m_hole_target_diameter = current_diameter + m_hole_clearance;
+    }
+    ImGui::PopItemWidth();
+
+    const bool valid_target = m_hole_target_diameter > current_diameter + EPSILON;
+    m_imgui->disabled_begin(!valid_target);
+    if (m_imgui->button(_L("Add negative cylinder"))) {
+        const GLVolume* source_volume = static_cast<const GLVolume*>(circle_feature.volume);
+        if (source_volume && wxGetApp().obj_list()->load_negative_cylinder_from_world_circle(*source_volume, center, normal, m_hole_target_diameter))
+            m_imgui->set_requires_extra_frame();
+    }
+    m_imgui->disabled_end();
+    if (!valid_target)
+        m_imgui->warning_text(_L("Target diameter must be larger than the current diameter."));
+}
+
 void GLGizmoMeasure::show_point_point_assembly()
 {
 }
@@ -2545,6 +2602,7 @@ void GLGizmoMeasure::on_render_input_window(float x, float y, float bottom_limit
 
     ImGui::Separator();
     show_distance_xyz_ui();
+    show_hole_enlargement_ui();
     ImGui::Separator();
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 10.0f));

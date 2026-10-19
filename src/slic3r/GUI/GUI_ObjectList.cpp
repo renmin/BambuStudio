@@ -2567,6 +2567,63 @@ void ObjectList::load_generic_subobject(const std::string& type_name, const Mode
     }
 }
 
+bool ObjectList::load_negative_cylinder_from_world_circle(const GLVolume& source_volume, const Vec3d& world_center, const Vec3d& world_normal, double diameter, double depth)
+{
+    const int obj_idx = source_volume.object_idx();
+    int       instance_idx = source_volume.instance_idx();
+    if (obj_idx < 0 || obj_idx >= int(m_objects->size()) || diameter <= 0.0)
+        return false;
+
+    ModelObject& model_object = *(*m_objects)[obj_idx];
+    if (model_object.instances.empty())
+        return false;
+    if (instance_idx < 0 || instance_idx >= int(model_object.instances.size()))
+        instance_idx = 0;
+
+    Vec3d axis = world_normal;
+    if (axis.norm() < EPSILON)
+        return false;
+    axis.normalize();
+
+    const BoundingBoxf3 instance_bb = model_object.instance_bounding_box(instance_idx);
+    if (depth <= 0.0)
+        depth = instance_bb.defined ? std::max(1.0, 1.25 * instance_bb.size().norm()) : diameter * 4.0;
+
+    take_snapshot("Add negative cylinder for hole");
+
+    TriangleMesh mesh(its_make_cylinder(0.5 * diameter, depth, PI / 90.0));
+    ModelVolume* new_volume = model_object.add_volume(std::move(mesh), ModelVolumeType::NEGATIVE_VOLUME, false);
+    if (!new_volume)
+        return false;
+
+    Matrix3d rotation_matrix;
+    Vec3d    rotation_axis;
+    double   rotation_angle = 0.0;
+    Geometry::rotation_from_two_vectors(Vec3d::UnitZ(), axis, rotation_axis, rotation_angle, &rotation_matrix);
+
+    Transform3d cylinder_world = Transform3d::Identity();
+    cylinder_world.linear() = rotation_matrix;
+    cylinder_world.translation() = world_center - 0.5 * depth * axis;
+
+    const Transform3d instance_inverse = model_object.instances[instance_idx]->get_transformation().get_matrix().inverse();
+    new_volume->set_transformation(Geometry::Transformation(instance_inverse * cylinder_world));
+    new_volume->name = into_u8(_L("Hole enlargement cut"));
+    new_volume->source.is_from_builtin_objects = true;
+    model_object.invalidate_bounding_box();
+
+    select_item([this, obj_idx, new_volume]() {
+        wxDataViewItem sel_item;
+        wxDataViewItemArray items = reorder_volumes_and_get_selection(obj_idx, [new_volume](const ModelVolume* volume) { return volume == new_volume; });
+        if (!items.IsEmpty())
+            sel_item = items.front();
+        return sel_item;
+    });
+
+    notify_instance_updated(obj_idx);
+    wxGetApp().params_panel()->switch_to_object(true);
+    return true;
+}
+
 void GUI::ObjectList::add_new_model_object_from_old_object() {
     const Selection &selection = scene_selection();
     int instance_idx = *selection.get_instance_idxs().begin();
