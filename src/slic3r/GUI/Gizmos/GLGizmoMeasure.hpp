@@ -332,7 +332,7 @@ protected:
     mutable unsigned int     m_current_active_imgui_id;
     std::optional<Measure::SurfaceFeature> m_hole_enlargement_circle;
     double                   m_hole_target_diameter{0.0};
-    double                   m_hole_clearance{0.2};
+    std::string              m_hole_target_diameter_text;
 };
 
 } // namespace GUI

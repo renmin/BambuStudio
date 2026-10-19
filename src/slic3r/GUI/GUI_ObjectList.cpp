@@ -27,6 +27,8 @@
 #include <boost/algorithm/string.hpp>
 #include <wx/progdlg.h>
 #include <libslic3r/Orient.hpp>
+#include <array>
+#include <limits>
 #include <unordered_set>
 #include <wx/listbook.h>
 #include <wx/numformatter.h>
@@ -2586,8 +2588,35 @@ bool ObjectList::load_negative_cylinder_from_world_circle(const GLVolume& source
     axis.normalize();
 
     const BoundingBoxf3 instance_bb = model_object.instance_bounding_box(instance_idx);
-    if (depth <= 0.0)
-        depth = instance_bb.defined ? std::max(1.0, 1.25 * instance_bb.size().norm()) : diameter * 4.0;
+    double start_projection = world_center.dot(axis) - 0.5 * depth;
+    if (depth <= 0.0) {
+        if (instance_bb.defined) {
+            const std::array<Vec3d, 8> corners = {
+                Vec3d(instance_bb.min.x(), instance_bb.min.y(), instance_bb.min.z()),
+                Vec3d(instance_bb.min.x(), instance_bb.min.y(), instance_bb.max.z()),
+                Vec3d(instance_bb.min.x(), instance_bb.max.y(), instance_bb.min.z()),
+                Vec3d(instance_bb.min.x(), instance_bb.max.y(), instance_bb.max.z()),
+                Vec3d(instance_bb.max.x(), instance_bb.min.y(), instance_bb.min.z()),
+                Vec3d(instance_bb.max.x(), instance_bb.min.y(), instance_bb.max.z()),
+                Vec3d(instance_bb.max.x(), instance_bb.max.y(), instance_bb.min.z()),
+                Vec3d(instance_bb.max.x(), instance_bb.max.y(), instance_bb.max.z())
+            };
+            double min_projection = std::numeric_limits<double>::max();
+            double max_projection = std::numeric_limits<double>::lowest();
+            for (const Vec3d& corner : corners) {
+                const double projection = corner.dot(axis);
+                min_projection = std::min(min_projection, projection);
+                max_projection = std::max(max_projection, projection);
+            }
+
+            const double margin = std::max(0.5, 0.05 * diameter);
+            start_projection = min_projection - margin;
+            depth = std::max(1.0, max_projection - min_projection + 2.0 * margin);
+        } else {
+            depth = diameter * 4.0;
+            start_projection = world_center.dot(axis) - 0.5 * depth;
+        }
+    }
 
     take_snapshot("Add negative cylinder for hole");
 
@@ -2603,7 +2632,7 @@ bool ObjectList::load_negative_cylinder_from_world_circle(const GLVolume& source
 
     Transform3d cylinder_world = Transform3d::Identity();
     cylinder_world.linear() = rotation_matrix;
-    cylinder_world.translation() = world_center - 0.5 * depth * axis;
+    cylinder_world.translation() = world_center + (start_projection - world_center.dot(axis)) * axis;
 
     const Transform3d instance_inverse = model_object.instances[instance_idx]->get_transformation().get_matrix().inverse();
     new_volume->set_transformation(Geometry::Transformation(instance_inverse * cylinder_world));

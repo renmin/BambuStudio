@@ -12,7 +12,10 @@
 #include "libslic3r/MeasureUtils.hpp"
 
 #include <imgui/imgui_internal.h>
+#include "imgui/imgui_stdlib.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <numeric>
 
 #include <GL/glew.h>
@@ -23,6 +26,42 @@
 
 namespace Slic3r {
 namespace GUI {
+namespace {
+
+bool parse_hole_target_diameter_expr(const std::string& text, double& value)
+{
+    value = 0.0;
+    const char* ptr = text.c_str();
+    bool parsed_term = false;
+
+    while (*ptr != '\0') {
+        while (std::isspace(static_cast<unsigned char>(*ptr)))
+            ++ptr;
+
+        char* end = nullptr;
+        const double term = std::strtod(ptr, &end);
+        if (end == ptr || term < 0.0)
+            return false;
+
+        value += term;
+        parsed_term = true;
+        ptr = end;
+
+        while (std::isspace(static_cast<unsigned char>(*ptr)))
+            ++ptr;
+
+        if (*ptr == '\0')
+            return parsed_term;
+        if (*ptr != '+')
+            return false;
+        ++ptr;
+    }
+
+    return parsed_term;
+}
+
+}
+
 std::string GLGizmoMeasure::format_double(double value)
 {
     char buf[1024];
@@ -2424,7 +2463,13 @@ void GLGizmoMeasure::show_hole_enlargement_ui()
 
     if (!m_hole_enlargement_circle.has_value() || *m_hole_enlargement_circle != circle_feature) {
         m_hole_enlargement_circle = circle_feature;
-        m_hole_target_diameter = current_diameter + m_hole_clearance;
+        constexpr double default_clearance_mm = 5.0;
+        m_hole_target_diameter = current_diameter + default_clearance_mm;
+        const double display_target = m_use_inches ? GizmoObjectManipulation::mm_to_in * m_hole_target_diameter : m_hole_target_diameter;
+        const double display_clearance = m_use_inches ? GizmoObjectManipulation::mm_to_in * default_clearance_mm : default_clearance_mm;
+        char target_buf[64];
+        sprintf(target_buf, "%.2f+%.2f", display_target - display_clearance, display_clearance);
+        m_hole_target_diameter_text = target_buf;
     }
 
     ImGui::Separator();
@@ -2433,32 +2478,28 @@ void GLGizmoMeasure::show_hole_enlargement_ui()
     const double display_current_diameter = m_use_inches ? GizmoObjectManipulation::mm_to_in * current_diameter : current_diameter;
     m_imgui->text(_u8L("Current diameter") + ": " + format_double(display_current_diameter) + m_units);
 
-    ImGui::PushItemWidth(m_input_size_max);
+    ImGui::PushItemWidth(1.6f * m_input_size_max);
     m_imgui->text(_u8L("Target diameter:"));
     ImGui::SameLine(m_imgui->calc_text_size(_u8L("Target diameter:")).x + m_space_size);
-    double display_target_diameter = m_use_inches ? GizmoObjectManipulation::mm_to_in * m_hole_target_diameter : m_hole_target_diameter;
-    if (ImGui::BBLInputDouble("##hole_target_diameter", &display_target_diameter, 0.0f, 0.0f, "%.2f")) {
-        m_hole_target_diameter = m_use_inches ? display_target_diameter / GizmoObjectManipulation::mm_to_in : display_target_diameter;
-    }
-
-    m_imgui->text(_u8L("Clearance:"));
-    ImGui::SameLine(m_imgui->calc_text_size(_u8L("Target diameter:")).x + m_space_size);
-    double display_clearance = m_use_inches ? GizmoObjectManipulation::mm_to_in * m_hole_clearance : m_hole_clearance;
-    if (ImGui::BBLInputDouble("##hole_clearance", &display_clearance, 0.0f, 0.0f, "%.2f")) {
-        m_hole_clearance = m_use_inches ? display_clearance / GizmoObjectManipulation::mm_to_in : display_clearance;
-        m_hole_target_diameter = current_diameter + m_hole_clearance;
-    }
+    ImGui::InputText("##hole_target_diameter", &m_hole_target_diameter_text, ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank);
     ImGui::PopItemWidth();
 
+    double display_target_diameter = 0.0;
+    const bool valid_expr = parse_hole_target_diameter_expr(m_hole_target_diameter_text, display_target_diameter);
+    if (valid_expr)
+        m_hole_target_diameter = m_use_inches ? display_target_diameter / GizmoObjectManipulation::mm_to_in : display_target_diameter;
+
     const bool valid_target = m_hole_target_diameter > current_diameter + EPSILON;
-    m_imgui->disabled_begin(!valid_target);
+    m_imgui->disabled_begin(!valid_expr || !valid_target);
     if (m_imgui->button(_L("Add negative cylinder"))) {
         const GLVolume* source_volume = static_cast<const GLVolume*>(circle_feature.volume);
         if (source_volume && wxGetApp().obj_list()->load_negative_cylinder_from_world_circle(*source_volume, center, normal, m_hole_target_diameter))
             m_imgui->set_requires_extra_frame();
     }
     m_imgui->disabled_end();
-    if (!valid_target)
+    if (!valid_expr)
+        m_imgui->warning_text(_L("Target diameter must be a number or an addition like 20+10."));
+    else if (!valid_target)
         m_imgui->warning_text(_L("Target diameter must be larger than the current diameter."));
 }
 
