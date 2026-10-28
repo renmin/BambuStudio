@@ -315,7 +315,8 @@ public:
     void                load_subobject(ModelVolumeType type, bool from_galery = false);
     void                load_from_files(const wxArrayString &input_files, ModelObject &model_object, std::vector<ModelVolume *> &added_volumes, ModelVolumeType type, bool from_galery = false);
     void                load_generic_subobject(const std::string& type_name, const ModelVolumeType type);
-    bool                load_negative_cylinder_from_world_circle(const GLVolume& source_volume, const Vec3d& world_center, const Vec3d& world_normal, double diameter, double depth = 0.0);
+    bool                load_negative_cylinder_from_world_circle(const GLVolume& source_volume, const Vec3d& world_center, const Vec3d& world_normal, double diameter, double depth = 0.0, double axial_extension = 0.0);
+    bool                load_positive_cylinder_from_world_circle(const GLVolume& source_volume, const Vec3d& world_center, const Vec3d& world_normal, double diameter, double depth = 0.0);
     void                add_new_model_object_from_old_object();
     void                load_shape_object(const std::string &type_name);
     void                load_mesh_object(const TriangleMesh &mesh, const wxString &name, bool center = true);

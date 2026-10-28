@@ -330,9 +330,18 @@ protected:
     std::string              m_units;
     mutable bool             m_same_model_object;
     mutable unsigned int     m_current_active_imgui_id;
+    float                    m_input_window_min_width{0.0f};
+    enum class HoleDepthMode : unsigned char {
+        AutoDefault,
+        AutoEdge,
+        Manual
+    };
     std::optional<Measure::SurfaceFeature> m_hole_enlargement_circle;
     double                   m_hole_target_diameter{0.0};
     std::string              m_hole_target_diameter_text;
+    double                   m_hole_depth{0.0};
+    std::string              m_hole_depth_text;
+    HoleDepthMode            m_hole_depth_mode{HoleDepthMode::AutoDefault};
 };
 
 } // namespace GUI

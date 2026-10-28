@@ -85,6 +85,32 @@ static void take_snapshot(const std::string& snapshot_name)
         plater->take_snapshot(snapshot_name);
 }
 
+static bool calc_bbox_projection_range(const BoundingBoxf3& bb, const Vec3d& axis, double& min_projection, double& max_projection)
+{
+    if (!bb.defined)
+        return false;
+
+    const std::array<Vec3d, 8> corners = {
+        Vec3d(bb.min.x(), bb.min.y(), bb.min.z()),
+        Vec3d(bb.min.x(), bb.min.y(), bb.max.z()),
+        Vec3d(bb.min.x(), bb.max.y(), bb.min.z()),
+        Vec3d(bb.min.x(), bb.max.y(), bb.max.z()),
+        Vec3d(bb.max.x(), bb.min.y(), bb.min.z()),
+        Vec3d(bb.max.x(), bb.min.y(), bb.max.z()),
+        Vec3d(bb.max.x(), bb.max.y(), bb.min.z()),
+        Vec3d(bb.max.x(), bb.max.y(), bb.max.z())
+    };
+
+    min_projection = std::numeric_limits<double>::max();
+    max_projection = std::numeric_limits<double>::lowest();
+    for (const Vec3d& corner : corners) {
+        const double projection = corner.dot(axis);
+        min_projection = std::min(min_projection, projection);
+        max_projection = std::max(max_projection, projection);
+    }
+    return true;
+}
+
 class wxRenderer : public wxDelegateRendererNative
 {
 public:
@@ -2569,7 +2595,7 @@ void ObjectList::load_generic_subobject(const std::string& type_name, const Mode
     }
 }
 
-bool ObjectList::load_negative_cylinder_from_world_circle(const GLVolume& source_volume, const Vec3d& world_center, const Vec3d& world_normal, double diameter, double depth)
+bool ObjectList::load_negative_cylinder_from_world_circle(const GLVolume& source_volume, const Vec3d& world_center, const Vec3d& world_normal, double diameter, double depth, double axial_extension)
 {
     const int obj_idx = source_volume.object_idx();
     int       instance_idx = source_volume.instance_idx();
@@ -2588,34 +2614,33 @@ bool ObjectList::load_negative_cylinder_from_world_circle(const GLVolume& source
     axis.normalize();
 
     const BoundingBoxf3 instance_bb = model_object.instance_bounding_box(instance_idx);
-    double start_projection = world_center.dot(axis) - 0.5 * depth;
+    const double center_projection = world_center.dot(axis);
+    double start_projection = center_projection - 0.5 * depth;
     if (depth <= 0.0) {
-        if (instance_bb.defined) {
-            const std::array<Vec3d, 8> corners = {
-                Vec3d(instance_bb.min.x(), instance_bb.min.y(), instance_bb.min.z()),
-                Vec3d(instance_bb.min.x(), instance_bb.min.y(), instance_bb.max.z()),
-                Vec3d(instance_bb.min.x(), instance_bb.max.y(), instance_bb.min.z()),
-                Vec3d(instance_bb.min.x(), instance_bb.max.y(), instance_bb.max.z()),
-                Vec3d(instance_bb.max.x(), instance_bb.min.y(), instance_bb.min.z()),
-                Vec3d(instance_bb.max.x(), instance_bb.min.y(), instance_bb.max.z()),
-                Vec3d(instance_bb.max.x(), instance_bb.max.y(), instance_bb.min.z()),
-                Vec3d(instance_bb.max.x(), instance_bb.max.y(), instance_bb.max.z())
-            };
-            double min_projection = std::numeric_limits<double>::max();
-            double max_projection = std::numeric_limits<double>::lowest();
-            for (const Vec3d& corner : corners) {
-                const double projection = corner.dot(axis);
-                min_projection = std::min(min_projection, projection);
-                max_projection = std::max(max_projection, projection);
-            }
-
+        double min_projection = 0.0;
+        double max_projection = 0.0;
+        if (calc_bbox_projection_range(instance_bb, axis, min_projection, max_projection)) {
             const double margin = std::max(0.5, 0.05 * diameter);
             start_projection = min_projection - margin;
             depth = std::max(1.0, max_projection - min_projection + 2.0 * margin);
         } else {
             depth = diameter * 4.0;
-            start_projection = world_center.dot(axis) - 0.5 * depth;
+            start_projection = center_projection - 0.5 * depth;
         }
+    } else {
+        double min_projection = 0.0;
+        double max_projection = 0.0;
+        if (calc_bbox_projection_range(instance_bb, axis, min_projection, max_projection)) {
+            const double dist_to_min = std::abs(center_projection - min_projection);
+            const double dist_to_max = std::abs(max_projection - center_projection);
+            const bool   extend_towards_min = dist_to_min >= dist_to_max;
+            // For explicit depth, keep one cylinder end on the selected circle plane and extend inward.
+            start_projection = extend_towards_min ? (center_projection - depth) : center_projection;
+        }
+    }
+    if (axial_extension > 0.0) {
+        start_projection -= axial_extension;
+        depth += 2.0 * axial_extension;
     }
 
     take_snapshot("Add negative cylinder for hole");
@@ -2648,6 +2673,88 @@ bool ObjectList::load_negative_cylinder_from_world_circle(const GLVolume& source
         return sel_item;
     });
 
+    notify_instance_updated(obj_idx);
+    wxGetApp().params_panel()->switch_to_object(true);
+    return true;
+}
+
+bool ObjectList::load_positive_cylinder_from_world_circle(const GLVolume& source_volume, const Vec3d& world_center, const Vec3d& world_normal, double diameter, double depth)
+{
+    const int obj_idx = source_volume.object_idx();
+    int       instance_idx = source_volume.instance_idx();
+    if (obj_idx < 0 || obj_idx >= int(m_objects->size()) || diameter <= 0.0)
+        return false;
+
+    ModelObject& model_object = *(*m_objects)[obj_idx];
+    if (model_object.instances.empty())
+        return false;
+    if (instance_idx < 0 || instance_idx >= int(model_object.instances.size()))
+        instance_idx = 0;
+
+    Vec3d axis = world_normal;
+    if (axis.norm() < EPSILON)
+        return false;
+    axis.normalize();
+
+    const BoundingBoxf3 instance_bb = model_object.instance_bounding_box(instance_idx);
+    const double center_projection = world_center.dot(axis);
+    double start_projection = center_projection - 0.5 * depth;
+    if (depth <= 0.0) {
+        double min_projection = 0.0;
+        double max_projection = 0.0;
+        if (calc_bbox_projection_range(instance_bb, axis, min_projection, max_projection)) {
+            const double margin = std::max(0.5, 0.05 * diameter);
+            start_projection = min_projection - margin;
+            depth = std::max(1.0, max_projection - min_projection + 2.0 * margin);
+        } else {
+            depth = diameter * 4.0;
+            start_projection = center_projection - 0.5 * depth;
+        }
+    } else {
+        double min_projection = 0.0;
+        double max_projection = 0.0;
+        if (calc_bbox_projection_range(instance_bb, axis, min_projection, max_projection)) {
+            const double dist_to_min = std::abs(center_projection - min_projection);
+            const double dist_to_max = std::abs(max_projection - center_projection);
+            const bool   extend_towards_min = dist_to_min >= dist_to_max;
+            // For explicit depth, keep one cylinder end on the selected circle plane and extend inward.
+            start_projection = extend_towards_min ? (center_projection - depth) : center_projection;
+        }
+    }
+
+    take_snapshot("Add positive cylinder for hole");
+
+    TriangleMesh mesh(its_make_cylinder(0.5 * diameter, depth, PI / 90.0));
+    ModelVolume* new_volume = model_object.add_volume(std::move(mesh), ModelVolumeType::MODEL_PART, false);
+    if (!new_volume)
+        return false;
+
+    Matrix3d rotation_matrix;
+    Vec3d    rotation_axis;
+    double   rotation_angle = 0.0;
+    Geometry::rotation_from_two_vectors(Vec3d::UnitZ(), axis, rotation_axis, rotation_angle, &rotation_matrix);
+
+    Transform3d cylinder_world = Transform3d::Identity();
+    cylinder_world.linear() = rotation_matrix;
+    cylinder_world.translation() = world_center + (start_projection - world_center.dot(axis)) * axis;
+
+    const Transform3d instance_inverse = model_object.instances[instance_idx]->get_transformation().get_matrix().inverse();
+    new_volume->set_transformation(Geometry::Transformation(instance_inverse * cylinder_world));
+    new_volume->name = into_u8(_L("Hole fill part"));
+    new_volume->source.is_from_builtin_objects = true;
+    if (model_object.config.has("extruder"))
+        new_volume->config.set_key_value("extruder", new ConfigOptionInt(model_object.config.opt_int("extruder")));
+    model_object.invalidate_bounding_box();
+
+    select_item([this, obj_idx, new_volume]() {
+        wxDataViewItem sel_item;
+        wxDataViewItemArray items = reorder_volumes_and_get_selection(obj_idx, [new_volume](const ModelVolume* volume) { return volume == new_volume; });
+        if (!items.IsEmpty())
+            sel_item = items.front();
+        return sel_item;
+    });
+
+    wxGetApp().plater()->get_view3D_canvas3D()->update_instance_printable_state_for_object((size_t)obj_idx);
     notify_instance_updated(obj_idx);
     wxGetApp().params_panel()->switch_to_object(true);
     return true;

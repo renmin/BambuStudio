@@ -15,7 +15,10 @@
 #include "imgui/imgui_stdlib.h"
 
 #include <cctype>
+#include <cfloat>
 #include <cstdlib>
+#include <array>
+#include <limits>
 #include <numeric>
 
 #include <GL/glew.h>
@@ -32,32 +35,87 @@ bool parse_hole_target_diameter_expr(const std::string& text, double& value)
 {
     value = 0.0;
     const char* ptr = text.c_str();
-    bool parsed_term = false;
+    while (std::isspace(static_cast<unsigned char>(*ptr)))
+        ++ptr;
 
-    while (*ptr != '\0') {
-        while (std::isspace(static_cast<unsigned char>(*ptr)))
-            ++ptr;
+    char* end = nullptr;
+    const double first_term = std::strtod(ptr, &end);
+    if (end == ptr || first_term < 0.0)
+        return false;
 
-        char* end = nullptr;
-        const double term = std::strtod(ptr, &end);
-        if (end == ptr || term < 0.0)
-            return false;
+    value = first_term;
+    ptr = end;
 
-        value += term;
-        parsed_term = true;
-        ptr = end;
-
+    while (true) {
         while (std::isspace(static_cast<unsigned char>(*ptr)))
             ++ptr;
 
         if (*ptr == '\0')
-            return parsed_term;
-        if (*ptr != '+')
+            return true;
+
+        const char op = *ptr;
+        if (op != '+' && op != '-')
             return false;
         ++ptr;
+
+        while (std::isspace(static_cast<unsigned char>(*ptr)))
+            ++ptr;
+
+        end = nullptr;
+        const double term = std::strtod(ptr, &end);
+        if (end == ptr || term < 0.0)
+            return false;
+
+        value += (op == '+') ? term : -term;
+        ptr = end;
+    }
+}
+
+double calc_default_hole_depth_mm(const Selection& selection, const GLVolume& source_volume, const Vec3d& world_axis, double diameter)
+{
+    if (diameter <= 0.0)
+        return 0.0;
+
+    const Model* model = selection.get_model();
+    if (!model)
+        return diameter * 4.0;
+
+    const int obj_idx = source_volume.object_idx();
+    int       instance_idx = source_volume.instance_idx();
+    if (obj_idx < 0 || obj_idx >= int(model->objects.size()))
+        return diameter * 4.0;
+
+    const ModelObject* model_object = model->objects[obj_idx];
+    if (!model_object || model_object->instances.empty())
+        return diameter * 4.0;
+    if (instance_idx < 0 || instance_idx >= int(model_object->instances.size()))
+        instance_idx = 0;
+
+    const BoundingBoxf3 instance_bb = model_object->instance_bounding_box(instance_idx);
+    if (!instance_bb.defined)
+        return diameter * 4.0;
+
+    const std::array<Vec3d, 8> corners = {
+        Vec3d(instance_bb.min.x(), instance_bb.min.y(), instance_bb.min.z()),
+        Vec3d(instance_bb.min.x(), instance_bb.min.y(), instance_bb.max.z()),
+        Vec3d(instance_bb.min.x(), instance_bb.max.y(), instance_bb.min.z()),
+        Vec3d(instance_bb.min.x(), instance_bb.max.y(), instance_bb.max.z()),
+        Vec3d(instance_bb.max.x(), instance_bb.min.y(), instance_bb.min.z()),
+        Vec3d(instance_bb.max.x(), instance_bb.min.y(), instance_bb.max.z()),
+        Vec3d(instance_bb.max.x(), instance_bb.max.y(), instance_bb.min.z()),
+        Vec3d(instance_bb.max.x(), instance_bb.max.y(), instance_bb.max.z())
+    };
+
+    double min_projection = std::numeric_limits<double>::max();
+    double max_projection = std::numeric_limits<double>::lowest();
+    for (const Vec3d& corner : corners) {
+        const double projection = corner.dot(world_axis);
+        min_projection = std::min(min_projection, projection);
+        max_projection = std::max(max_projection, projection);
     }
 
-    return parsed_term;
+    const double margin = std::max(0.5, 0.05 * diameter);
+    return std::max(1.0, max_projection - min_projection + 2.0 * margin);
 }
 
 }
@@ -371,8 +429,8 @@ bool GLGizmoMeasure::on_mouse(const wxMouseEvent &mouse_event)
                     }
                 }
                 else {
-                    remove_selected_sphere_raycaster(SEL_SPHERE_1_ID);
                     if (m_selected_features.second.feature.has_value()) {
+                        remove_selected_sphere_raycaster(SEL_SPHERE_1_ID);
                         // promote 2nd feature to 1st feature
                         reset_feature1();
                         if (requires_sphere_raycaster_for_picking(m_selected_features.first)) {
@@ -380,8 +438,14 @@ bool GLGizmoMeasure::on_mouse(const wxMouseEvent &mouse_event)
                             m_gripper_id_raycast_map[GripperType::SPHERE_1] = pick;
                         }
                     } else {
-                        // 1st feature deselection
-                        reset_feature1();
+                        // Keep the 1st circle selected in measure mode so the user can continue
+                        // selecting a 2nd feature (for example an edge as hole-depth reference).
+                        if (!(m_measure_mode == EMeasureMode::ONLY_MEASURE &&
+                              m_selected_features.first.feature->get_type() == Measure::SurfaceFeatureType::Circle)) {
+                            remove_selected_sphere_raycaster(SEL_SPHERE_1_ID);
+                            // 1st feature deselection
+                            reset_feature1();
+                        }
                     }
                 }
             }
@@ -2447,7 +2511,7 @@ void GLGizmoMeasure::show_distance_xyz_ui()
 
 void GLGizmoMeasure::show_hole_enlargement_ui()
 {
-    if (m_measure_mode != EMeasureMode::ONLY_MEASURE || m_selected_features.second.feature.has_value() ||
+    if (m_measure_mode != EMeasureMode::ONLY_MEASURE ||
         !m_selected_features.first.feature.has_value() ||
         m_selected_features.first.feature->get_type() != Measure::SurfaceFeatureType::Circle)
         return;
@@ -2460,6 +2524,17 @@ void GLGizmoMeasure::show_hole_enlargement_ui()
     const Vec3d on_circle = center + radius * Measure::get_orthogonal(normal, true);
     radius = (on_circle - center).norm();
     const double current_diameter = 2.0 * radius;
+    const Vec3d axis = normal.normalized();
+
+    const GLVolume* source_volume = static_cast<const GLVolume*>(circle_feature.volume);
+    const double auto_depth = source_volume ? calc_default_hole_depth_mm(m_parent.get_selection(), *source_volume, axis, current_diameter) : (current_diameter * 4.0);
+    auto set_depth_from_mm = [this](double depth_mm) {
+        m_hole_depth = depth_mm;
+        const double display_depth = m_use_inches ? GizmoObjectManipulation::mm_to_in * depth_mm : depth_mm;
+        char depth_buf[64];
+        sprintf(depth_buf, "%.3f", display_depth);
+        m_hole_depth_text = depth_buf;
+    };
 
     if (!m_hole_enlargement_circle.has_value() || *m_hole_enlargement_circle != circle_feature) {
         m_hole_enlargement_circle = circle_feature;
@@ -2470,37 +2545,106 @@ void GLGizmoMeasure::show_hole_enlargement_ui()
         char target_buf[64];
         sprintf(target_buf, "%.2f+%.2f", display_target - display_clearance, display_clearance);
         m_hole_target_diameter_text = target_buf;
+        set_depth_from_mm(auto_depth);
+        m_hole_depth_mode = HoleDepthMode::AutoDefault;
     }
 
     ImGui::Separator();
-    m_imgui->text(_L("Hole enlargement"));
+    m_imgui->text(_L("Hole enlarge / fill"));
 
     const double display_current_diameter = m_use_inches ? GizmoObjectManipulation::mm_to_in * current_diameter : current_diameter;
     m_imgui->text(_u8L("Current diameter") + ": " + format_double(display_current_diameter) + m_units);
 
-    ImGui::PushItemWidth(1.6f * m_input_size_max);
-    m_imgui->text(_u8L("Target diameter:"));
-    ImGui::SameLine(m_imgui->calc_text_size(_u8L("Target diameter:")).x + m_space_size);
-    ImGui::InputText("##hole_target_diameter", &m_hole_target_diameter_text, ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank);
-    ImGui::PopItemWidth();
+    const float hole_input_width = 1.6f * m_input_size_max;
+    const float stable_hole_panel_width = m_imgui->calc_text_size(_u8L("Tip: Select an edge as Selection 2 to set depth automatically.")).x;
+    ImGui::Dummy(ImVec2(stable_hole_panel_width, 0.0f));
+    const auto draw_right_aligned_expr_input = [this, hole_input_width](const std::string& label, const char* input_id, std::string& value) {
+        const float row_start_x = ImGui::GetCursorPosX();
+        const float row_max_x = row_start_x + ImGui::GetContentRegionAvail().x;
+        m_imgui->text(label);
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX() + m_space_size, row_max_x - hole_input_width));
+        ImGui::PushItemWidth(hole_input_width);
+        const bool changed = ImGui::InputText(input_id, &value, ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank);
+        ImGui::PopItemWidth();
+        return changed;
+    };
 
+    draw_right_aligned_expr_input(_u8L("Target diameter:"), "##hole_target_diameter", m_hole_target_diameter_text);
     double display_target_diameter = 0.0;
     const bool valid_expr = parse_hole_target_diameter_expr(m_hole_target_diameter_text, display_target_diameter);
     if (valid_expr)
         m_hole_target_diameter = m_use_inches ? display_target_diameter / GizmoObjectManipulation::mm_to_in : display_target_diameter;
 
-    const bool valid_target = m_hole_target_diameter > current_diameter + EPSILON;
-    m_imgui->disabled_begin(!valid_expr || !valid_target);
-    if (m_imgui->button(_L("Add negative cylinder"))) {
-        const GLVolume* source_volume = static_cast<const GLVolume*>(circle_feature.volume);
-        if (source_volume && wxGetApp().obj_list()->load_negative_cylinder_from_world_circle(*source_volume, center, normal, m_hole_target_diameter))
+    double edge_length = 0.0;
+    bool depth_from_edge = false;
+    if (m_selected_features.second.feature.has_value() &&
+        m_selected_features.second.feature->get_type() == Measure::SurfaceFeatureType::Edge) {
+        const auto [sp, ep] = m_selected_features.second.feature->get_edge();
+        edge_length = (ep - sp).norm();
+        depth_from_edge = edge_length > EPSILON;
+    }
+
+    // If Selection 2 is an edge, treat it as an explicit depth source and keep depth synced.
+    if (depth_from_edge) {
+        if (m_hole_depth_mode != HoleDepthMode::AutoEdge || std::abs(m_hole_depth - edge_length) > EPSILON)
+            set_depth_from_mm(edge_length);
+        m_hole_depth_mode = HoleDepthMode::AutoEdge;
+    } else if (m_hole_depth_mode != HoleDepthMode::Manual) {
+        if (m_hole_depth_mode != HoleDepthMode::AutoDefault || std::abs(m_hole_depth - auto_depth) > EPSILON)
+            set_depth_from_mm(auto_depth);
+        m_hole_depth_mode = HoleDepthMode::AutoDefault;
+    }
+
+    const bool depth_edited = draw_right_aligned_expr_input(_u8L("Depth:"), "##hole_depth", m_hole_depth_text);
+    if (depth_edited)
+        m_hole_depth_mode = HoleDepthMode::Manual;
+
+    double display_user_depth = 0.0;
+    const bool valid_depth_expr = parse_hole_target_diameter_expr(m_hole_depth_text, display_user_depth);
+    const bool non_negative_depth = !valid_depth_expr || (display_user_depth >= 0.0);
+    if (valid_depth_expr)
+        m_hole_depth = m_use_inches ? display_user_depth / GizmoObjectManipulation::mm_to_in : display_user_depth;
+
+    const double effective_depth = (valid_depth_expr && non_negative_depth && m_hole_depth > EPSILON) ? m_hole_depth : 0.0;
+
+    ImGui::PushTextWrapPos(0.0f);
+    m_imgui->text(_u8L("Tip: Select an edge as Selection 2 to set depth automatically."));
+    ImGui::PopTextWrapPos();
+
+    const bool non_negative_target = m_hole_target_diameter >= -EPSILON;
+    const bool valid_target = m_hole_target_diameter > EPSILON;
+    const bool valid_depth = valid_depth_expr && non_negative_depth;
+    const bool enlarge_hole = valid_target && (m_hole_target_diameter > current_diameter + EPSILON);
+    const bool fill_or_reduce_hole = valid_target && (m_hole_target_diameter < current_diameter - EPSILON);
+    const bool fill_all_hole = non_negative_target && (std::abs(m_hole_target_diameter) <= EPSILON);
+    m_imgui->disabled_begin(!valid_expr || !valid_depth || !(enlarge_hole || fill_or_reduce_hole || fill_all_hole));
+    if (m_imgui->button(enlarge_hole ? _L("Apply hole enlargement") : _L("Apply hole fill"))) {
+        constexpr double fill_overlap_radial_mm = 0.03;
+        constexpr double negative_axial_extension_mm = 0.10;
+        bool applied = false;
+        if (source_volume && enlarge_hole) {
+            applied = wxGetApp().obj_list()->load_negative_cylinder_from_world_circle(*source_volume, center, normal, m_hole_target_diameter, effective_depth, negative_axial_extension_mm);
+        } else if (source_volume && (fill_or_reduce_hole || fill_all_hole)) {
+            const double fill_diameter = current_diameter + 2.0 * fill_overlap_radial_mm;
+            applied = wxGetApp().obj_list()->load_positive_cylinder_from_world_circle(*source_volume, center, normal, fill_diameter, effective_depth);
+            if (applied && fill_or_reduce_hole && m_hole_target_diameter > EPSILON)
+                applied = wxGetApp().obj_list()->load_negative_cylinder_from_world_circle(*source_volume, center, normal, m_hole_target_diameter, effective_depth, negative_axial_extension_mm);
+        }
+        if (applied)
             m_imgui->set_requires_extra_frame();
     }
     m_imgui->disabled_end();
     if (!valid_expr)
-        m_imgui->warning_text(_L("Target diameter must be a number or an addition like 20+10."));
-    else if (!valid_target)
-        m_imgui->warning_text(_L("Target diameter must be larger than the current diameter."));
+        m_imgui->warning_text(_L("Target diameter must be a number or an expression like 20+10 or 20-5."));
+    else if (!non_negative_target)
+        m_imgui->warning_text(_L("Target diameter must be larger than or equal to 0."));
+    if (!valid_depth_expr)
+        m_imgui->warning_text(_L("Depth must be a number or an expression like 20+10 or 20-5."));
+    else if (!non_negative_depth)
+        m_imgui->warning_text(_L("Depth must be larger than or equal to 0."));
+    else if (!(enlarge_hole || fill_or_reduce_hole || fill_all_hole))
+        m_imgui->warning_text(_L("Target diameter is already equal to the current diameter."));
 }
 
 void GLGizmoMeasure::show_point_point_assembly()
@@ -2636,6 +2780,8 @@ void GLGizmoMeasure::on_render_input_window(float x, float y, float bottom_limit
             last_y = y;
     }
     ImGuiWrapper::push_toolbar_style(m_parent.get_scale());
+    const float min_window_width = m_input_window_min_width > 0.0f ? m_input_window_min_width : 0.0f;
+    ImGui::SetNextWindowSizeConstraints(ImVec2(min_window_width, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
     GizmoImguiBegin(get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
 
     init_render_input_window();
@@ -2663,6 +2809,7 @@ void GLGizmoMeasure::on_render_input_window(float x, float y, float bottom_limit
         last_selected_features = m_selected_features;
         m_imgui->set_requires_extra_frame();
     }
+    m_input_window_min_width = std::max(m_input_window_min_width, ImGui::GetWindowSize().x);
     m_last_active_item_imgui = m_current_active_imgui_id;
     GizmoImguiEnd();
     // Orca
