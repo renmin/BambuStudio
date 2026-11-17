@@ -28,7 +28,11 @@
 #include <wx/progdlg.h>
 #include <libslic3r/Orient.hpp>
 #include <array>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <limits>
+#include <unordered_map>
 #include <unordered_set>
 #include <wx/listbook.h>
 #include <wx/numformatter.h>
@@ -2744,6 +2748,304 @@ bool ObjectList::load_positive_cylinder_from_world_circle(const GLVolume& source
     new_volume->source.is_from_builtin_objects = true;
     if (model_object.config.has("extruder"))
         new_volume->config.set_key_value("extruder", new ConfigOptionInt(model_object.config.opt_int("extruder")));
+    model_object.invalidate_bounding_box();
+
+    select_item([this, obj_idx, new_volume]() {
+        wxDataViewItem sel_item;
+        wxDataViewItemArray items = reorder_volumes_and_get_selection(obj_idx, [new_volume](const ModelVolume* volume) { return volume == new_volume; });
+        if (!items.IsEmpty())
+            sel_item = items.front();
+        return sel_item;
+    });
+
+    wxGetApp().plater()->get_view3D_canvas3D()->update_instance_printable_state_for_object((size_t)obj_idx);
+    notify_instance_updated(obj_idx);
+    wxGetApp().params_panel()->switch_to_object(true);
+    return true;
+}
+
+bool ObjectList::load_positive_extrusion_from_world_plane(const GLVolume& source_volume, const std::vector<int>& triangle_indices, const Transform3d& world_tran, const Vec3d& world_normal, double depth, bool join_overlap_enabled)
+{
+    const int obj_idx = source_volume.object_idx();
+    int       instance_idx = source_volume.instance_idx();
+    if (obj_idx < 0 || obj_idx >= int(m_objects->size()) || triangle_indices.empty() || std::abs(depth) <= EPSILON)
+        return false;
+
+    const TriangleMesh* source_mesh = source_volume.ori_mesh;
+    if (!source_mesh)
+        return false;
+
+    ModelObject& model_object = *(*m_objects)[obj_idx];
+    if (model_object.instances.empty())
+        return false;
+    if (instance_idx < 0 || instance_idx >= int(model_object.instances.size()))
+        instance_idx = 0;
+
+    Vec3d axis = world_normal;
+    if (axis.norm() < EPSILON)
+        return false;
+    axis.normalize();
+    const Vec3d extrusion = axis * depth;
+    if (extrusion.norm() < EPSILON)
+        return false;
+    const Vec3d extrusion_dir = extrusion.normalized();
+    // Make sure the new part slightly penetrates the source body at the selected plane.
+    // Pure coplanar contact (no overlap) often slices as visually separated regions.
+    constexpr double plane_join_overlap_mm = 0.30;
+    const double overlap_mm = join_overlap_enabled ? plane_join_overlap_mm : 0.0;
+
+    std::vector<Vec3d> welded_vertices;
+    welded_vertices.reserve(triangle_indices.size() * 3);
+    std::vector<int> source_to_welded(source_mesh->its.vertices.size(), -1);
+    std::vector<Vec3i> top_tris;
+    top_tris.reserve(triangle_indices.size());
+
+    struct QuantizedVertex {
+        int64_t x;
+        int64_t y;
+        int64_t z;
+        bool operator==(const QuantizedVertex& other) const
+        {
+            return x == other.x && y == other.y && z == other.z;
+        }
+    };
+    struct QuantizedVertexHash {
+        size_t operator()(const QuantizedVertex& v) const
+        {
+            const size_t h1 = std::hash<int64_t>{}(v.x);
+            const size_t h2 = std::hash<int64_t>{}(v.y);
+            const size_t h3 = std::hash<int64_t>{}(v.z);
+            return h1 ^ (h2 << 1) ^ (h3 << 2);
+        }
+    };
+    std::unordered_map<QuantizedVertex, int, QuantizedVertexHash> welded_vertex_map;
+    welded_vertex_map.reserve(triangle_indices.size() * 3);
+
+    struct SortedTri {
+        int a;
+        int b;
+        int c;
+        bool operator==(const SortedTri& other) const
+        {
+            return a == other.a && b == other.b && c == other.c;
+        }
+    };
+    struct SortedTriHash {
+        size_t operator()(const SortedTri& t) const
+        {
+            const size_t h1 = std::hash<int>{}(t.a);
+            const size_t h2 = std::hash<int>{}(t.b);
+            const size_t h3 = std::hash<int>{}(t.c);
+            return h1 ^ (h2 << 1) ^ (h3 << 2);
+        }
+    };
+    std::unordered_set<SortedTri, SortedTriHash> unique_tris;
+    unique_tris.reserve(triangle_indices.size());
+
+    struct BoundaryEdge {
+        int count{0};
+        int from{-1};
+        int to{-1};
+    };
+    std::unordered_map<uint64_t, BoundaryEdge> boundary_edges;
+    boundary_edges.reserve(triangle_indices.size() * 3);
+
+    auto edge_key = [](int a, int b) {
+        const uint32_t lo = uint32_t(std::min(a, b));
+        const uint32_t hi = uint32_t(std::max(a, b));
+        return (uint64_t(hi) << 32) | uint64_t(lo);
+    };
+
+    auto weld_vertex = [&](int source_vertex_idx) -> int {
+        if (source_vertex_idx < 0 || source_vertex_idx >= int(source_to_welded.size()))
+            return -1;
+        if (source_to_welded[source_vertex_idx] >= 0)
+            return source_to_welded[source_vertex_idx];
+
+        constexpr double weld_eps = 1e-6;
+        const Vec3d world_vertex = world_tran * source_mesh->its.vertices[source_vertex_idx].cast<double>();
+        const QuantizedVertex qv{
+            int64_t(std::llround(world_vertex.x() / weld_eps)),
+            int64_t(std::llround(world_vertex.y() / weld_eps)),
+            int64_t(std::llround(world_vertex.z() / weld_eps))
+        };
+        auto it = welded_vertex_map.find(qv);
+        if (it != welded_vertex_map.end()) {
+            source_to_welded[source_vertex_idx] = it->second;
+            return it->second;
+        }
+
+        const int new_idx = int(welded_vertices.size());
+        welded_vertices.emplace_back(world_vertex);
+        welded_vertex_map.emplace(qv, new_idx);
+        source_to_welded[source_vertex_idx] = new_idx;
+        return new_idx;
+    };
+
+    for (const int tri_idx : triangle_indices) {
+        if (tri_idx < 0 || tri_idx >= int(source_mesh->its.indices.size()))
+            continue;
+
+        const auto& tri = source_mesh->its.indices[tri_idx];
+        const int   src_a = tri[0];
+        const int   src_b = tri[1];
+        const int   src_c = tri[2];
+        if (src_a < 0 || src_b < 0 || src_c < 0 ||
+            src_a >= int(source_mesh->its.vertices.size()) ||
+            src_b >= int(source_mesh->its.vertices.size()) ||
+            src_c >= int(source_mesh->its.vertices.size()))
+            continue;
+
+        const int a = weld_vertex(src_a);
+        const int b = weld_vertex(src_b);
+        const int c = weld_vertex(src_c);
+        if (a < 0 || b < 0 || c < 0)
+            continue;
+        if (a == b || b == c || c == a)
+            continue;
+
+        std::array<int, 3> sorted = {a, b, c};
+        std::sort(sorted.begin(), sorted.end());
+        if (!unique_tris.emplace(SortedTri{sorted[0], sorted[1], sorted[2]}).second)
+            continue;
+
+        const Vec3d& p0 = welded_vertices[a];
+        const Vec3d& p1 = welded_vertices[b];
+        const Vec3d& p2 = welded_vertices[c];
+
+        int t0 = a, t1 = b, t2 = c;
+        if ((p1 - p0).cross(p2 - p0).dot(extrusion) < 0.0)
+            std::swap(t1, t2);
+
+        top_tris.emplace_back(t0, t1, t2);
+
+        const std::array<std::pair<int, int>, 3> tri_edges = {
+            std::make_pair(t0, t1),
+            std::make_pair(t1, t2),
+            std::make_pair(t2, t0)
+        };
+        for (const auto& [from, to] : tri_edges) {
+            BoundaryEdge& edge = boundary_edges[edge_key(from, to)];
+            if (edge.count == 0) {
+                edge.from = from;
+                edge.to   = to;
+            }
+            ++edge.count;
+        }
+    }
+
+    if (welded_vertices.size() < 3 || top_tris.empty())
+        return false;
+
+    std::unordered_map<int, int> out_next;
+    out_next.reserve(boundary_edges.size());
+    std::unordered_map<int, int> in_degree;
+    in_degree.reserve(boundary_edges.size());
+    std::vector<std::pair<int, int>> boundary_directed_edges;
+    boundary_directed_edges.reserve(boundary_edges.size());
+
+    for (const auto& [_, edge] : boundary_edges) {
+        if (edge.count == 0)
+            continue;
+        if (edge.count > 2)
+            return false;
+        if (edge.count == 1) {
+            if (edge.from < 0 || edge.to < 0 || edge.from == edge.to)
+                return false;
+            if (out_next.find(edge.from) != out_next.end())
+                return false;
+            out_next.emplace(edge.from, edge.to);
+            ++in_degree[edge.to];
+            boundary_directed_edges.emplace_back(edge.from, edge.to);
+        }
+    }
+
+    if (boundary_directed_edges.empty())
+        return false;
+    for (const auto& [from, to] : boundary_directed_edges) {
+        (void) to;
+        if (in_degree[from] != 1)
+            return false;
+    }
+
+    std::unordered_set<uint64_t> visited_boundary;
+    visited_boundary.reserve(boundary_directed_edges.size());
+    std::vector<std::vector<int>> boundary_loops;
+    boundary_loops.reserve(4);
+    for (const auto& [start_from, start_to] : boundary_directed_edges) {
+        const uint64_t start_key = edge_key(start_from, start_to);
+        if (visited_boundary.find(start_key) != visited_boundary.end())
+            continue;
+
+        std::vector<int> loop;
+        loop.reserve(64);
+        int current = start_from;
+        int guard = 0;
+        const int max_guard = int(boundary_directed_edges.size()) + 1;
+        while (guard++ < max_guard) {
+            loop.emplace_back(current);
+            auto next_it = out_next.find(current);
+            if (next_it == out_next.end())
+                return false;
+            const int next = next_it->second;
+            const uint64_t ekey = edge_key(current, next);
+            if (!visited_boundary.emplace(ekey).second)
+                break;
+            current = next;
+            if (current == start_from)
+                break;
+        }
+        if (loop.size() < 3 || current != start_from)
+            return false;
+        boundary_loops.emplace_back(std::move(loop));
+    }
+
+    if (boundary_loops.empty())
+        return false;
+
+    indexed_triangle_set extrusion_its;
+    extrusion_its.vertices.reserve(welded_vertices.size() * 2);
+    extrusion_its.indices.reserve(top_tris.size() * 2 + boundary_directed_edges.size() * 2);
+
+    for (const Vec3d& v : welded_vertices)
+        extrusion_its.vertices.emplace_back((v - extrusion_dir * overlap_mm).cast<float>());
+    for (const Vec3d& v : welded_vertices)
+        extrusion_its.vertices.emplace_back((v + extrusion).cast<float>());
+
+    const int top_offset = int(welded_vertices.size());
+    for (const Vec3i& tri : top_tris)
+        extrusion_its.indices.emplace_back(tri[2], tri[1], tri[0]);
+    for (const Vec3i& tri : top_tris)
+        extrusion_its.indices.emplace_back(tri[0] + top_offset, tri[1] + top_offset, tri[2] + top_offset);
+
+    for (const auto& loop : boundary_loops) {
+        for (size_t i = 0; i < loop.size(); ++i) {
+            const int a = loop[i];
+            const int b = loop[(i + 1) % loop.size()];
+            const int c = b + top_offset;
+            const int d = a + top_offset;
+            extrusion_its.indices.emplace_back(a, b, c);
+            extrusion_its.indices.emplace_back(a, c, d);
+        }
+    }
+
+    if (extrusion_its.indices.empty())
+        return false;
+
+    take_snapshot("Add plane extrusion part");
+
+    TriangleMesh mesh(std::move(extrusion_its));
+    ModelVolume* new_volume = model_object.add_volume(std::move(mesh), ModelVolumeType::MODEL_PART, false);
+    if (!new_volume)
+        return false;
+
+    const Transform3d instance_inverse = model_object.instances[instance_idx]->get_transformation().get_matrix().inverse();
+    new_volume->set_transformation(Geometry::Transformation(instance_inverse));
+    new_volume->name = into_u8(_L("Plane extrusion part"));
+    new_volume->source.is_from_builtin_objects = true;
+    if (model_object.config.has("extruder"))
+        new_volume->config.set_key_value("extruder", new ConfigOptionInt(model_object.config.opt_int("extruder")));
+
     model_object.invalidate_bounding_box();
 
     select_item([this, obj_idx, new_volume]() {

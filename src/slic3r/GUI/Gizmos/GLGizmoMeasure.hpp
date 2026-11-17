@@ -273,6 +273,8 @@ protected:
     void         show_selection_ui();
     void         show_distance_xyz_ui();
     void         show_hole_enlargement_ui();
+    void         show_plane_extrusion_ui();
+    void         render_plane_extrusion_direction() const;
     void         show_point_point_assembly();
     void         show_face_face_assembly_common();
     void         show_face_face_assembly_senior();
@@ -342,6 +344,11 @@ protected:
     double                   m_hole_depth{0.0};
     std::string              m_hole_depth_text;
     HoleDepthMode            m_hole_depth_mode{HoleDepthMode::AutoDefault};
+    std::optional<Measure::SurfaceFeature> m_plane_extrusion_feature;
+    double                   m_plane_extrusion_depth{0.0};
+    std::string              m_plane_extrusion_depth_text;
+    bool                     m_plane_extrusion_join_overlap_enabled{true};
+    std::shared_ptr<GLModel> m_plane_extrusion_arrow{nullptr};
 };
 
 } // namespace GUI

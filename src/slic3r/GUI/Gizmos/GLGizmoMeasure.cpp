@@ -71,6 +71,46 @@ bool parse_hole_target_diameter_expr(const std::string& text, double& value)
     }
 }
 
+bool parse_signed_value_expr(const std::string& text, double& value)
+{
+    value = 0.0;
+    const char* ptr = text.c_str();
+    while (std::isspace(static_cast<unsigned char>(*ptr)))
+        ++ptr;
+
+    char* end = nullptr;
+    const double first_term = std::strtod(ptr, &end);
+    if (end == ptr)
+        return false;
+
+    value = first_term;
+    ptr = end;
+
+    while (true) {
+        while (std::isspace(static_cast<unsigned char>(*ptr)))
+            ++ptr;
+
+        if (*ptr == '\0')
+            return true;
+
+        const char op = *ptr;
+        if (op != '+' && op != '-')
+            return false;
+        ++ptr;
+
+        while (std::isspace(static_cast<unsigned char>(*ptr)))
+            ++ptr;
+
+        end = nullptr;
+        const double term = std::strtod(ptr, &end);
+        if (end == ptr)
+            return false;
+
+        value += (op == '+') ? term : -term;
+        ptr = end;
+    }
+}
+
 double calc_default_hole_depth_mm(const Selection& selection, const GLVolume& source_volume, const Vec3d& world_axis, double diameter)
 {
     if (diameter <= 0.0)
@@ -292,6 +332,9 @@ GLGizmoMeasure::GLGizmoMeasure(GLCanvas3D& parent, unsigned int sprite_id)
     m_cylinder = std::make_shared<GLModel>();
     m_cylinder->init_from(std::move(cylinder_geometry), true);
     m_gripper_id_raycast_map[GripperType::EDGE] = std::make_shared<PickRaycaster>(m_cylinder->mesh,EDGE_ID);
+
+    m_plane_extrusion_arrow = std::make_shared<GLModel>();
+    m_plane_extrusion_arrow->init_from(its_make_cone(1.0, 1.0, 2 * PI / 36.0));
 }
 
 GLGizmoMeasure::~GLGizmoMeasure() = default;
@@ -1542,6 +1585,7 @@ void GLGizmoMeasure::on_render()
         glsafe(::glClear(GL_DEPTH_BUFFER_BIT));
         m_rotate_gizmo->render();
     }
+    render_plane_extrusion_direction();
 }
 
 void GLGizmoMeasure::update_if_needed()
@@ -2647,6 +2691,121 @@ void GLGizmoMeasure::show_hole_enlargement_ui()
         m_imgui->warning_text(_L("Target diameter is already equal to the current diameter."));
 }
 
+void GLGizmoMeasure::show_plane_extrusion_ui()
+{
+    if (m_measure_mode != EMeasureMode::ONLY_MEASURE ||
+        !m_selected_features.first.feature.has_value() ||
+        m_selected_features.first.feature->get_type() != Measure::SurfaceFeatureType::Plane)
+        return;
+
+    Measure::SurfaceFeature& plane_feature = *m_selected_features.first.feature;
+    if (!plane_feature.volume)
+        return;
+
+    if (!plane_feature.plane_indices || plane_feature.plane_indices->empty())
+        return;
+
+    if (!m_plane_extrusion_feature.has_value() || *m_plane_extrusion_feature != plane_feature) {
+        m_plane_extrusion_feature = plane_feature;
+        m_plane_extrusion_depth = 5.0;
+        const double display_depth = m_use_inches ? GizmoObjectManipulation::mm_to_in * m_plane_extrusion_depth : m_plane_extrusion_depth;
+        char depth_buf[64];
+        sprintf(depth_buf, "%.2f", display_depth);
+        m_plane_extrusion_depth_text = depth_buf;
+    }
+
+    ImGui::Separator();
+    m_imgui->text(_L("Plane extrusion"));
+
+    const float plane_input_width = 1.6f * m_input_size_max;
+    const auto draw_right_aligned_expr_input = [this, plane_input_width](const std::string& label, const char* input_id, std::string& value) {
+        const float row_start_x = ImGui::GetCursorPosX();
+        const float row_max_x = row_start_x + ImGui::GetContentRegionAvail().x;
+        m_imgui->text(label);
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX() + m_space_size, row_max_x - plane_input_width));
+        ImGui::PushItemWidth(plane_input_width);
+        const bool changed = ImGui::InputText(input_id, &value, ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank);
+        ImGui::PopItemWidth();
+        return changed;
+    };
+
+    draw_right_aligned_expr_input(_u8L("Depth:"), "##plane_extrusion_depth", m_plane_extrusion_depth_text);
+
+    double display_depth = 0.0;
+    bool valid_depth_expr = parse_signed_value_expr(m_plane_extrusion_depth_text, display_depth);
+    if (valid_depth_expr)
+        m_plane_extrusion_depth = m_use_inches ? display_depth / GizmoObjectManipulation::mm_to_in : display_depth;
+
+    constexpr double plane_join_overlap_mm = 0.30;
+    const double overlap_display = m_use_inches ? GizmoObjectManipulation::mm_to_in * plane_join_overlap_mm : plane_join_overlap_mm;
+    m_imgui->bbl_checkbox(_L("Enable join overlap"), m_plane_extrusion_join_overlap_enabled);
+    ImGui::PushTextWrapPos(0.0f);
+    m_imgui->text(_u8L("Depth > 0: along plane normal. Depth < 0: reverse direction."));
+    m_imgui->text(_u8L("Join overlap: ") + format_double(overlap_display) + m_units + _u8L(" (internal only, not included in Depth)."));
+    ImGui::PopTextWrapPos();
+
+    const bool valid_depth = valid_depth_expr && std::abs(m_plane_extrusion_depth) > EPSILON;
+    m_imgui->disabled_begin(!valid_depth);
+    if (m_imgui->button(_L("Apply plane extrusion"))) {
+        const GLVolume* source_volume = static_cast<const GLVolume*>(plane_feature.volume);
+        const auto [plane_idx, normal, plane_point] = plane_feature.get_plane();
+        (void) plane_idx;
+        (void) plane_point;
+        if (source_volume && plane_feature.plane_indices) {
+            if (wxGetApp().obj_list()->load_positive_extrusion_from_world_plane(*source_volume, *plane_feature.plane_indices, plane_feature.world_tran, normal, m_plane_extrusion_depth, m_plane_extrusion_join_overlap_enabled))
+                m_imgui->set_requires_extra_frame();
+        }
+    }
+    m_imgui->disabled_end();
+
+    if (!valid_depth_expr)
+        m_imgui->warning_text(_L("Depth must be a number or an expression like 10+2 or 10-2."));
+    else if (std::abs(m_plane_extrusion_depth) <= EPSILON)
+        m_imgui->warning_text(_L("Depth cannot be 0."));
+}
+
+void GLGizmoMeasure::render_plane_extrusion_direction() const
+{
+    if (m_measure_mode != EMeasureMode::ONLY_MEASURE ||
+        !m_selected_features.first.feature.has_value() ||
+        m_selected_features.first.feature->get_type() != Measure::SurfaceFeatureType::Plane ||
+        !m_plane_extrusion_arrow)
+        return;
+
+    const Measure::SurfaceFeature& plane_feature = *m_selected_features.first.feature;
+    if (!plane_feature.volume)
+        return;
+
+    double display_depth = 0.0;
+    if (!parse_signed_value_expr(m_plane_extrusion_depth_text, display_depth))
+        return;
+    const bool use_inches = wxGetApp().app_config->get("use_inches") == "1";
+    const double depth = use_inches ? display_depth / GizmoObjectManipulation::mm_to_in : display_depth;
+    if (std::abs(depth) <= EPSILON)
+        return;
+
+    auto [plane_idx, normal, point] = plane_feature.get_plane();
+    (void) plane_idx;
+    if (normal.norm() < EPSILON)
+        return;
+
+    Vec3d direction = normal.normalized();
+    if (depth < 0.0)
+        direction = -direction;
+
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    const auto& view_matrix = camera.get_view_matrix();
+    const auto& projection_matrix = camera.get_projection_matrix();
+    const double size = get_grabber_size() * 0.75;
+    const Vec3d arrow_pos = point + direction * (1.8 * size);
+    const Transform3d arrow_matrix = Geometry::translation_transform(arrow_pos) *
+        Eigen::Quaternion<double>::FromTwoVectors(Vec3d::UnitZ(), direction) *
+        Geometry::scale_transform(Vec3d(0.85 * size, 0.85 * size, 3.2 * size));
+    const std::array<float, 4> arrow_color = { 0.0f, 174.0f / 255.0f, 66.0f / 255.0f, 1.0f };
+    render_glmodel(*m_plane_extrusion_arrow, arrow_color, view_matrix * arrow_matrix, projection_matrix, false, 0.15f);
+}
+
 void GLGizmoMeasure::show_point_point_assembly()
 {
 }
@@ -2790,6 +2949,7 @@ void GLGizmoMeasure::on_render_input_window(float x, float y, float bottom_limit
     ImGui::Separator();
     show_distance_xyz_ui();
     show_hole_enlargement_ui();
+    show_plane_extrusion_ui();
     ImGui::Separator();
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 10.0f));

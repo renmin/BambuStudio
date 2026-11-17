@@ -12,6 +12,7 @@ See the [wiki](https://github.com/bambulab/BambuStudio/wiki) and the [documentat
 # What are Bambu Studio's main features?
 Key features are:
 - Basic slicing features & GCode viewer
+- Measure tool plane extrusion with signed depth, direction arrow preview, and optional internal join-overlap
 - Multiple plates management
 - Remote control & monitoring
 - Auto-arrange objects
@@ -50,4 +51,3 @@ The GNU Affero General Public License, version 3 ensures that if you use any par
 
 The bambu networking plugin is based on non-free libraries. It is optional to the Bambu Studio and provides extended networking functionalities for users.
 By default, after installing Bambu Studio without the networking plugin, you can initiate printing through the SD card after slicing is completed.
-
